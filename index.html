@@ -1,0 +1,2574 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>Kiba</title>
+<link rel="icon" href="data:," />
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #1B2130; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef } = React;
+
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyAanWAHmr3wboULjMZpGp_aiuFLsFw9YC4",
+  projectId: "kiba-fa62c",
+};
+
+function firestoreDocUrl(uid) {
+  return `https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents/users/${uid}/kiba/state`;
+}
+
+async function firebaseSignIn(email, password) {
+  const res = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_CONFIG.apiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password, returnSecureToken: true }),
+    }
+  );
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error?.message || "Anmeldung fehlgeschlagen");
+  return data;
+}
+
+async function firebaseRefreshToken(refreshToken) {
+  const res = await fetch(`https://securetoken.googleapis.com/v1/token?key=${FIREBASE_CONFIG.apiKey}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(refreshToken)}`,
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error?.message || "Sitzung konnte nicht erneuert werden");
+  return data;
+}
+
+async function firestoreGetState(idToken, uid) {
+  const res = await fetch(firestoreDocUrl(uid), {
+    headers: { Authorization: `Bearer ${idToken}` },
+  });
+  if (res.status === 404) return null;
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error?.message || "Firestore-Fehler beim Laden");
+  const f = data.fields || {};
+  const parseField = (name) => {
+    try {
+      return f[name]?.stringValue ? JSON.parse(f[name].stringValue) : null;
+    } catch (e) {
+      return null;
+    }
+  };
+  return {
+    projects: parseField("projectsJson"),
+    tasks: parseField("tasksJson"),
+    inbox: parseField("inboxJson"),
+    categories: parseField("categoriesJson"),
+    voiceNotes: parseField("notesJson"),
+  };
+}
+
+async function firestoreSetState(idToken, uid, state) {
+  const body = {
+    fields: {
+      projectsJson: { stringValue: JSON.stringify(state.projects) },
+      tasksJson: { stringValue: JSON.stringify(state.tasks) },
+      inboxJson: { stringValue: JSON.stringify(state.inbox) },
+      categoriesJson: { stringValue: JSON.stringify(state.categories) },
+      notesJson: { stringValue: JSON.stringify(state.voiceNotes) },
+      updatedAt: { stringValue: new Date().toISOString() },
+    },
+  };
+  const res = await fetch(firestoreDocUrl(uid), {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error?.message || "Firestore-Fehler beim Speichern");
+  return data;
+}
+
+function decodeJwt(token) {
+  try {
+    const payload = token.split(".")[1];
+    const json = decodeURIComponent(
+      atob(payload.replace(/-/g, "+").replace(/_/g, "/"))
+        .split("")
+        .map((c) => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
+        .join("")
+    );
+    return JSON.parse(json);
+  } catch (e) {
+    return {};
+  }
+}
+
+const DEFAULT_CATEGORIES = [
+  { id: "bauvorhaben", name: "Bauvorhaben", color: "#E8B54B", order: 0 },
+  { id: "privat", name: "Privat", color: "#6FBF8B", order: 1 },
+  { id: "betrieblich", name: "Betrieblich", color: "#7FA8E0", order: 2 },
+];
+
+const CATEGORY_COLOR_PALETTE = ["#E8B54B", "#6FBF8B", "#7FA8E0", "#E2704F", "#B08FD6", "#5FC7C2", "#D6C568"];
+
+const TASK_TYPES = {
+  allgemein: { label: "Allgemein", icon: "•" },
+  telefonat: { label: "Anruf", icon: "📞" },
+  email: { label: "E-Mail", icon: "✉️" },
+  kalkulation: { label: "Kalkulation", icon: "🧮" },
+  material: { label: "Material bestellen", icon: "📦" },
+};
+
+const DEFAULT_PROJECTS = [
+  { id: "privat", name: "Privat", type: "privat", isArchived: false, order: 0 },
+  { id: "betrieblich", name: "Betrieblich (allgemein)", type: "betrieblich", isArchived: false, order: 1 },
+];
+
+function activeProjects(projects, alsoInclude) {
+  return projects.filter((p) => !p.isArchived || p.id === alsoInclude);
+}
+
+function stripRedundantTypeWord(name, categoryName) {
+  if (!name) return name;
+  if (!categoryName) return name.trim();
+  const re = new RegExp("^" + categoryName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s+", "i");
+  return name.trim().replace(re, "").trim() || name.trim();
+}
+
+function uid(prefix = "") {
+  return prefix + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+}
+
+function todayIso() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function fmtDeadline(iso) {
+  if (!iso) return null;
+  const d = new Date(iso + "T00:00:00");
+  return d.toLocaleDateString("de-DE", { day: "2-digit", month: "2-digit", year: "numeric" });
+}
+
+function priorityColor(p) {
+  if (p >= 8) return "#E2704F";
+  if (p >= 4) return "#E8B54B";
+  return "#6E7A94";
+}
+
+function daysUntil(iso) {
+  if (!iso) return null;
+  const today = new Date(todayIso() + "T00:00:00");
+  const target = new Date(iso + "T00:00:00");
+  return Math.round((target - today) / 86400000);
+}
+
+const EFFORT_OPTIONS = Array.from({ length: 32 }, (_, i) => (i + 1) * 0.25);
+
+function fmtEffort(hours) {
+  if (!hours) return null;
+  const h = Math.floor(hours);
+  const m = Math.round((hours - h) * 60);
+  if (h === 0) return `${m} Min`;
+  if (m === 0) return `${h} Std`;
+  return `${h} Std ${m} Min`;
+}
+
+function WochenplanerApp({ auth, onLogout, onAuthRefreshed }) {
+  const [projects, setProjects] = useState(null);
+  const [tasks, setTasks] = useState(null);
+  const [inbox, setInbox] = useState(null);
+  const [categories, setCategories] = useState(null);
+  const [voiceNotes, setVoiceNotes] = useState(null);
+  const [activeTab, setActiveTab] = useState("heute");
+  const [filterProject, setFilterProject] = useState("alle");
+  const [hideDone, setHideDone] = useState(false);
+  const [saveState, setSaveState] = useState("idle");
+  const loadedRef = useRef(false);
+  const authRef = useRef(auth);
+  authRef.current = auth;
+
+  async function withAuthRetry(fn) {
+    try {
+      return await fn(authRef.current.idToken);
+    } catch (e) {
+      try {
+        const data = await firebaseRefreshToken(authRef.current.refreshToken);
+        const idToken = data.id_token;
+        const refreshed = {
+          idToken,
+          refreshToken: data.refresh_token,
+          uid: data.user_id,
+          email: decodeJwt(idToken).email || authRef.current.email,
+          expiresAt: Date.now() + Number(data.expires_in) * 1000,
+        };
+        authRef.current = refreshed;
+        onAuthRefreshed(refreshed);
+        return await fn(refreshed.idToken);
+      } catch (e2) {
+        throw e;
+      }
+    }
+  }
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const state = await withAuthRetry((token) => firestoreGetState(token, auth.uid));
+        setProjects(state && state.projects ? state.projects : DEFAULT_PROJECTS);
+        setTasks(state && state.tasks ? state.tasks : []);
+        setInbox(state && state.inbox ? state.inbox : []);
+        setCategories(state && state.categories ? state.categories : DEFAULT_CATEGORIES);
+        setVoiceNotes(state && state.voiceNotes ? state.voiceNotes : []);
+      } catch (e) {
+        setSaveState("error");
+        setSaveError("Laden fehlgeschlagen: " + (e.message || String(e)));
+        setProjects(DEFAULT_PROJECTS);
+        setTasks([]);
+        setInbox([]);
+        setCategories(DEFAULT_CATEGORIES);
+        setVoiceNotes([]);
+      } finally {
+        loadedRef.current = true;
+      }
+    })();
+  }, [auth.uid]);
+
+  const saveChainRef = useRef(Promise.resolve());
+
+  const [saveError, setSaveError] = useState(null);
+
+  useEffect(() => {
+    if (!loadedRef.current || projects === null || tasks === null || inbox === null || categories === null || voiceNotes === null) return;
+    const snapshot = { projects, tasks, inbox, categories, voiceNotes };
+    setSaveState("saving");
+    saveChainRef.current = saveChainRef.current.then(async () => {
+      try {
+        await withAuthRetry((token) => firestoreSetState(token, auth.uid, snapshot));
+        setSaveState("saved");
+        setSaveError(null);
+      } catch (e) {
+        setSaveState("error");
+        setSaveError(e.message || String(e));
+      }
+    });
+  }, [projects, tasks, inbox, categories, voiceNotes]);
+
+  const projectById = useMemo(() => {
+    const m = {};
+    (projects || []).forEach((p) => (m[p.id] = p));
+    return m;
+  }, [projects]);
+
+  const categoryById = useMemo(() => {
+    const m = {};
+    (categories || []).forEach((c) => (m[c.id] = c));
+    return m;
+  }, [categories]);
+
+  function createCategory(name) {
+    const maxOrder = categories.reduce((m, c) => Math.max(m, c.order ?? 0), -1);
+    const color = CATEGORY_COLOR_PALETTE[categories.length % CATEGORY_COLOR_PALETTE.length];
+    const c = { id: uid("cat_"), name: name.trim(), color, order: maxOrder + 1 };
+    setCategories((prev) => [...prev, c]);
+    return c;
+  }
+
+  function renameCategory(id, name) {
+    setCategories((prev) => prev.map((c) => (c.id === id ? { ...c, name: name.trim() } : c)));
+  }
+
+  function deleteCategory(id) {
+    if (projects.some((p) => p.type === id)) return false;
+    setCategories((prev) => prev.filter((c) => c.id !== id));
+    return true;
+  }
+
+  function moveCategory(id, direction) {
+    setCategories((prev) => {
+      const sorted = [...prev].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+      const idx = sorted.findIndex((c) => c.id === id);
+      const swapIdx = direction === "up" ? idx - 1 : idx + 1;
+      if (swapIdx < 0 || swapIdx >= sorted.length) return prev;
+      const a = sorted[idx];
+      const b = sorted[swapIdx];
+      return prev.map((c) => {
+        if (c.id === a.id) return { ...c, order: b.order ?? 0 };
+        if (c.id === b.id) return { ...c, order: a.order ?? 0 };
+        return c;
+      });
+    });
+  }
+
+  function importAllData(data) {
+    if (data.projects) setProjects(data.projects);
+    if (data.tasks) setTasks(data.tasks);
+    if (data.inbox) setInbox(data.inbox);
+    if (data.categories) setCategories(data.categories);
+    if (data.voiceNotes) setVoiceNotes(data.voiceNotes);
+  }
+
+  function addVoiceNote(note) {
+    setVoiceNotes((prev) => [{ id: uid("note_"), capturedAt: new Date().toISOString(), ...note }, ...prev]);
+  }
+
+  function updateVoiceNote(id, patch) {
+    setVoiceNotes((prev) => prev.map((n) => (n.id === id ? { ...n, ...patch } : n)));
+  }
+
+  function deleteVoiceNote(id) {
+    setVoiceNotes((prev) => prev.filter((n) => n.id !== id));
+  }
+
+  function createProject(name, type) {
+    const maxOrder = projects.reduce((m, p) => Math.max(m, p.order ?? 0), 0);
+    const p = { id: uid("proj_"), name: name.trim(), type, isArchived: false, order: maxOrder + 1 };
+    setProjects((prev) => [...prev, p]);
+    return p;
+  }
+
+  function deleteProject(id) {
+    setProjects((prev) => {
+      if (prev.length <= 1) return prev;
+      const fallback = prev.find((p) => p.id !== id);
+      if (fallback) {
+        setTasks((prevTasks) => prevTasks.map((t) => (t.projectId === id ? { ...t, projectId: fallback.id } : t)));
+      }
+      return prev.filter((p) => p.id !== id);
+    });
+  }
+
+  function updateProject(id, patch) {
+    setProjects((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+  }
+
+  function archiveProject(id) {
+    setProjects((prev) => prev.map((p) => (p.id === id ? { ...p, isArchived: true } : p)));
+  }
+
+  function unarchiveProject(id) {
+    setProjects((prev) => prev.map((p) => (p.id === id ? { ...p, isArchived: false } : p)));
+  }
+
+  function moveProject(id, direction) {
+    setProjects((prev) => {
+      const proj = prev.find((p) => p.id === id);
+      if (!proj) return prev;
+      const siblings = prev.filter((p) => p.type === proj.type && !p.isArchived).sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+      const idx = siblings.findIndex((p) => p.id === id);
+      const swapIdx = direction === "up" ? idx - 1 : idx + 1;
+      if (swapIdx < 0 || swapIdx >= siblings.length) return prev;
+      const other = siblings[swapIdx];
+      return prev.map((p) => {
+        if (p.id === proj.id) return { ...p, order: other.order ?? 0 };
+        if (p.id === other.id) return { ...p, order: proj.order ?? 0 };
+        return p;
+      });
+    });
+  }
+
+  function addTask(task) {
+    setTasks((prev) => [...prev, { id: uid("task_"), done: false, notes: "", type: "allgemein", estimatedHours: null, ...task }]);
+  }
+
+  function updateTask(id, patch) {
+    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
+  }
+
+  function deleteTask(id) {
+    setTasks((prev) => prev.filter((t) => t.id !== id));
+  }
+
+  function addToInbox(text) {
+    setInbox((prev) => [...prev, { id: uid("inbox_"), text, capturedAt: new Date().toISOString() }]);
+  }
+
+  function removeFromInbox(ids) {
+    const idSet = new Set(Array.isArray(ids) ? ids : [ids]);
+    setInbox((prev) => prev.filter((i) => !idSet.has(i.id)));
+  }
+
+  const loading = projects === null || tasks === null || inbox === null || categories === null || voiceNotes === null;
+
+  return (
+    <div style={{ background: "#1B2130", minHeight: "100vh", fontFamily: "Inter, sans-serif" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+        .sg { font-family: 'Space Grotesk', sans-serif; }
+        .mono { font-family: 'JetBrains Mono', monospace; }
+        ::selection { background: #E8B54B55; }
+        .fade-in { animation: fadeIn 0.18s ease-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes pulseRing { 0% { box-shadow: 0 0 0 0 #E2704F55; } 70% { box-shadow: 0 0 0 14px #E2704F00; } 100% { box-shadow: 0 0 0 0 #E2704F00; } }
+        .mic-live { animation: pulseRing 1.4s ease-out infinite; }
+        .scrollbar-thin::-webkit-scrollbar { height: 6px; width: 6px; }
+        .scrollbar-thin::-webkit-scrollbar-thumb { background: #38415A; border-radius: 3px; }
+        input:focus, textarea:focus, select:focus, button:focus-visible { outline: 2px solid #E8B54B; outline-offset: 1px; }
+        input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.6); }
+      `}</style>
+
+      <div className="max-w-3xl mx-auto px-4 py-6 md:py-8">
+        <div className="flex items-center justify-between mb-5">
+          <div>
+            <h1 className="sg text-2xl" style={{ color: "#EDEAE2", fontWeight: 600 }}>
+              Wochenplaner
+            </h1>
+            <p className="mono text-[11px] mt-0.5" style={{ color: saveState === "error" ? "#E2704F" : "#6E7A94" }}>
+              {loading ? "lädt …" : saveState === "saving" ? "speichert …" : saveState === "error" ? "Speichern fehlgeschlagen" : "gespeichert"}
+            </p>
+            {saveState === "error" && saveError && (
+              <p className="mono text-[10px] mt-0.5" style={{ color: "#E2704F", maxWidth: 320 }}>
+                {saveError}
+              </p>
+            )}
+          </div>
+          <div className="text-right flex-shrink-0">
+            <p className="mono text-[10px] mb-1" style={{ color: "#4B5468" }}>
+              {auth.email}
+            </p>
+            <button onClick={onLogout} className="mono text-[10px] px-2 py-1 rounded" style={{ background: "transparent", border: "1px solid #38415A", color: "#6E7A94" }}>
+              Abmelden
+            </button>
+          </div>
+        </div>
+
+        <div className="flex gap-1 mb-6 items-center">
+          <div className="flex gap-1 rounded-xl p-1 overflow-x-auto scrollbar-thin flex-1" style={{ background: "#242C3E" }}>
+            {[
+              { id: "heute", label: "Aktuell" },
+              { id: "erfassen", label: "Diktieren", badge: inbox && inbox.length > 0 ? inbox.length : null },
+              { id: "alle", label: "Alle Aufgaben" },
+              { id: "notizen", label: "Sprachnotizen" },
+              { id: "projekte", label: "Listen" },
+            ].map((tab) => (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className="sg flex-1 text-sm rounded-lg py-2 transition-colors relative flex-shrink-0"
+                style={{
+                  background: activeTab === tab.id ? "#E8B54B" : "transparent",
+                  color: activeTab === tab.id ? "#1B2130" : "#9AA3B5",
+                  fontWeight: 600,
+                  minWidth: 84,
+                  padding: "0.5rem 0.75rem",
+                }}
+              >
+                {tab.label}
+                {tab.badge && (
+                  <span
+                    className="mono"
+                    style={{
+                      position: "absolute",
+                      top: 2,
+                      right: 8,
+                      fontSize: 9,
+                      background: "#E2704F",
+                      color: "#EDEAE2",
+                      borderRadius: 999,
+                      padding: "1px 5px",
+                    }}
+                  >
+                    {tab.badge}
+                  </span>
+                )}
+              </button>
+            ))}
+          </div>
+          <button
+            onClick={() => setActiveTab("einstellungen")}
+            className="flex-shrink-0 rounded-xl flex items-center justify-center"
+            style={{
+              width: 42,
+              height: 42,
+              background: activeTab === "einstellungen" ? "#E8B54B" : "#242C3E",
+              border: "none",
+              fontSize: 18,
+            }}
+            aria-label="Einstellungen"
+          >
+            ⚙
+          </button>
+        </div>
+
+        {loading ? (
+          <div style={{ color: "#6E7A94" }}>Lade …</div>
+        ) : (
+          <>
+            {activeTab === "heute" && (
+              <HeuteTab
+                tasks={tasks}
+                projectById={projectById}
+                categoryById={categoryById}
+                projects={projects}
+                updateTask={updateTask}
+                deleteTask={deleteTask}
+              />
+            )}
+            {activeTab === "erfassen" && (
+              <ErfassenTab
+                projects={projects}
+                categories={categories}
+                createProject={createProject}
+                addTask={addTask}
+                inbox={inbox}
+                addToInbox={addToInbox}
+                removeFromInbox={removeFromInbox}
+                addVoiceNote={addVoiceNote}
+              />
+            )}
+            {activeTab === "notizen" && (
+              <NotizenTab voiceNotes={voiceNotes} updateVoiceNote={updateVoiceNote} deleteVoiceNote={deleteVoiceNote} />
+            )}
+            {activeTab === "alle" && (
+              <AlleAufgabenTab
+                tasks={tasks}
+                projects={projects}
+                projectById={projectById}
+                categoryById={categoryById}
+                filterProject={filterProject}
+                setFilterProject={setFilterProject}
+                hideDone={hideDone}
+                setHideDone={setHideDone}
+                updateTask={updateTask}
+                deleteTask={deleteTask}
+                addTask={addTask}
+              />
+            )}
+            {activeTab === "projekte" && (
+              <ProjekteTab
+                projects={projects}
+                tasks={tasks}
+                createProject={createProject}
+                deleteProject={deleteProject}
+                updateProject={updateProject}
+                archiveProject={archiveProject}
+                unarchiveProject={unarchiveProject}
+                moveProject={moveProject}
+                categories={categories}
+                onOpenProject={(id) => {
+                  setFilterProject(id);
+                  setActiveTab("alle");
+                }}
+              />
+            )}
+            {activeTab === "einstellungen" && (
+              <EinstellungenTab
+                projects={projects}
+                tasks={tasks}
+                inbox={inbox}
+                categories={categories}
+                voiceNotes={voiceNotes}
+                onImport={importAllData}
+                createCategory={createCategory}
+                renameCategory={renameCategory}
+                deleteCategory={deleteCategory}
+                moveCategory={moveCategory}
+              />
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function EinstellungenTab({ projects, tasks, inbox, categories, voiceNotes, onImport, createCategory, renameCategory, deleteCategory, moveCategory }) {
+  const sortedCategories = useMemo(() => categories.slice().sort((a, b) => (a.order ?? 0) - (b.order ?? 0)), [categories]);
+  return (
+    <div className="fade-in flex flex-col gap-8">
+      <div>
+        <h2 className="sg text-lg mb-3" style={{ color: "#EDEAE2", fontWeight: 600 }}>
+          Kategorien
+        </h2>
+        <CategoryManager categories={sortedCategories} projects={projects} createCategory={createCategory} renameCategory={renameCategory} deleteCategory={deleteCategory} moveCategory={moveCategory} />
+      </div>
+      <div>
+        <h2 className="sg text-lg mb-3" style={{ color: "#EDEAE2", fontWeight: 600 }}>
+          Daten
+        </h2>
+        <DatenTabContent projects={projects} tasks={tasks} inbox={inbox} categories={categories} voiceNotes={voiceNotes} onImport={onImport} />
+      </div>
+    </div>
+  );
+}
+
+function DatenTabContent({ projects, tasks, inbox, categories, voiceNotes, onImport }) {
+  const [importText, setImportText] = useState("");
+  const [confirmingImport, setConfirmingImport] = useState(false);
+  const [importError, setImportError] = useState(null);
+  const [importSuccess, setImportSuccess] = useState(false);
+  const exportRef = useRef(null);
+
+  const exportJson = useMemo(
+    () => JSON.stringify({ projects, tasks, inbox, categories, voiceNotes, exportedAt: new Date().toISOString() }, null, 2),
+    [projects, tasks, inbox, categories, voiceNotes]
+  );
+
+  function selectAllExport() {
+    if (exportRef.current) {
+      exportRef.current.focus();
+      exportRef.current.select();
+    }
+  }
+
+  function tryImport() {
+    setImportError(null);
+    setImportSuccess(false);
+    let parsed;
+    try {
+      parsed = JSON.parse(importText);
+    } catch (e) {
+      setImportError("Das ist kein gültiges gespeichertes Backup (JSON konnte nicht gelesen werden).");
+      return;
+    }
+    if (!parsed || (!parsed.tasks && !parsed.projects && !parsed.categories)) {
+      setImportError("In diesem Text wurden keine Aufgaben/Listen/Kategorien gefunden.");
+      return;
+    }
+    setConfirmingImport(true);
+  }
+
+  function confirmImport() {
+    let parsed;
+    try {
+      parsed = JSON.parse(importText);
+    } catch (e) {
+      setImportError("Das ist kein gültiges gespeichertes Backup.");
+      setConfirmingImport(false);
+      return;
+    }
+    onImport(parsed);
+    setConfirmingImport(false);
+    setImportSuccess(true);
+    setImportText("");
+  }
+
+  return (
+    <div className="fade-in flex flex-col gap-6">
+      <div>
+        <h3 className="sg text-sm mb-1" style={{ color: "#EDEAE2", fontWeight: 600 }}>
+          Daten sichern
+        </h3>
+        <p className="mono text-[11px] mb-3" style={{ color: "#6E7A94" }}>
+          Bei jedem neuen Veröffentlichen bekommt die App einen eigenen, leeren Speicher. Kopiere hier den Text, um deine Daten in eine neue Version zu übernehmen.
+        </p>
+        <textarea
+          ref={exportRef}
+          readOnly
+          value={exportJson}
+          rows={6}
+          className="w-full mono text-[10px] rounded-lg px-3 py-2.5"
+          style={{ background: "#1B2130", border: "1px solid #38415A", color: "#9AA3B5", resize: "vertical" }}
+          onClick={selectAllExport}
+        />
+        <button
+          onClick={selectAllExport}
+          className="sg text-xs rounded-lg px-3 py-2 mt-2"
+          style={{ background: "#E8B54B", color: "#1B2130", fontWeight: 600, border: "none" }}
+        >
+          Text auswählen zum Kopieren
+        </button>
+        <p className="mono text-[10px] mt-1" style={{ color: "#4B5468" }}>
+          Nach dem Antippen: Text markieren (oder Auswahl übernehmen) und mit der Tastatur/Menü kopieren.
+        </p>
+      </div>
+
+      <div>
+        <h3 className="sg text-sm mb-1" style={{ color: "#EDEAE2", fontWeight: 600 }}>
+          Daten wiederherstellen
+        </h3>
+        <p className="mono text-[11px] mb-3" style={{ color: "#6E7A94" }}>
+          Füge hier den zuvor kopierten Text aus der alten Version ein. Das ersetzt alle aktuellen Aufgaben, Listen und Kategorien in dieser App.
+        </p>
+        <textarea
+          value={importText}
+          onChange={(e) => { setImportText(e.target.value); setConfirmingImport(false); setImportError(null); setImportSuccess(false); }}
+          placeholder="Hier den gesicherten Text einfügen …"
+          rows={6}
+          className="w-full mono text-[10px] rounded-lg px-3 py-2.5"
+          style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2", resize: "vertical" }}
+        />
+        {importError && (
+          <p className="mono text-xs mt-2" style={{ color: "#E2704F" }}>
+            {importError}
+          </p>
+        )}
+        {importSuccess && (
+          <p className="mono text-xs mt-2" style={{ color: "#6FBF8B" }}>
+            Daten übernommen.
+          </p>
+        )}
+        {!confirmingImport ? (
+          <button
+            onClick={tryImport}
+            disabled={!importText.trim()}
+            className="sg text-xs rounded-lg px-3 py-2 mt-2"
+            style={{ background: importText.trim() ? "#E8B54B" : "#38415A", color: importText.trim() ? "#1B2130" : "#6E7A94", fontWeight: 600, border: "none" }}
+          >
+            Wiederherstellen
+          </button>
+        ) : (
+          <div className="rounded-lg p-3 mt-2" style={{ background: "#242C3E", border: "1px solid #E2704F55" }}>
+            <p className="mono text-xs mb-2" style={{ color: "#E2704F" }}>
+              Das überschreibt alle aktuellen Aufgaben, Listen und Kategorien in dieser App-Version. Fortfahren?
+            </p>
+            <div className="flex gap-2">
+              <button onClick={confirmImport} className="mono text-xs px-3 py-1.5 rounded" style={{ background: "#E2704F", color: "#1B2130", border: "none", fontWeight: 600 }}>
+                Ja, überschreiben
+              </button>
+              <button onClick={() => setConfirmingImport(false)} className="mono text-xs px-3 py-1.5 rounded" style={{ background: "#38415A", color: "#9AA3B5", border: "none" }}>
+                Abbrechen
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function getMondayDate(d) {
+  const date = new Date(d);
+  const day = date.getDay();
+  const diff = (day === 0 ? -6 : 1) - day;
+  date.setDate(date.getDate() + diff);
+  date.setHours(0, 0, 0, 0);
+  return date;
+}
+
+function isoFromDate(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function HeuteTab({ tasks, projectById, categoryById, projects, updateTask, deleteTask }) {
+  const today = todayIso();
+  const [filter, setFilter] = useState("aktuell");
+  const [hideDone, setHideDone] = useState(true);
+
+  const overdueAll = useMemo(
+    () =>
+      tasks
+        .filter((t) => !t.done && t.deadline && t.deadline < today)
+        .sort((a, b) => (a.deadline === b.deadline ? b.priority - a.priority : a.deadline < b.deadline ? -1 : 1)),
+    [tasks, today]
+  );
+
+  const dueTodayAll = useMemo(
+    () => tasks.filter((t) => t.deadline === today).sort((a, b) => (a.done !== b.done ? (a.done ? 1 : -1) : b.priority - a.priority)),
+    [tasks, today]
+  );
+
+  const doneToday = useMemo(() => tasks.filter((t) => t.done && t.deadline === today).length, [tasks, today]);
+
+  const weekRanges = useMemo(() => {
+    const monday = getMondayDate(new Date());
+    const sunday = new Date(monday);
+    sunday.setDate(monday.getDate() + 6);
+    const nextMonday = new Date(monday);
+    nextMonday.setDate(monday.getDate() + 7);
+    const nextSunday = new Date(nextMonday);
+    nextSunday.setDate(nextMonday.getDate() + 6);
+    return {
+      thisWeek: [isoFromDate(monday), isoFromDate(sunday)],
+      nextWeek: [isoFromDate(nextMonday), isoFromDate(nextSunday)],
+    };
+  }, []);
+
+  const thisWeekTasksAll = useMemo(() => {
+    const [start, end] = weekRanges.thisWeek;
+    return tasks
+      .filter((t) => t.deadline && t.deadline >= start && t.deadline <= end)
+      .sort((a, b) => (a.done !== b.done ? (a.done ? 1 : -1) : a.deadline !== b.deadline ? (a.deadline < b.deadline ? -1 : 1) : b.priority - a.priority));
+  }, [tasks, weekRanges]);
+
+  const nextWeekTasksAll = useMemo(() => {
+    const [start, end] = weekRanges.nextWeek;
+    return tasks
+      .filter((t) => t.deadline && t.deadline >= start && t.deadline <= end)
+      .sort((a, b) => (a.done !== b.done ? (a.done ? 1 : -1) : a.deadline !== b.deadline ? (a.deadline < b.deadline ? -1 : 1) : b.priority - a.priority));
+  }, [tasks, weekRanges]);
+
+  const applyHide = (list) => (hideDone ? list.filter((t) => !t.done) : list);
+
+  const overdue = useMemo(() => applyHide(overdueAll), [overdueAll, hideDone]);
+  const dueToday = useMemo(() => applyHide(dueTodayAll), [dueTodayAll, hideDone]);
+  const thisWeekTasks = useMemo(() => applyHide(thisWeekTasksAll), [thisWeekTasksAll, hideDone]);
+  const nextWeekTasks = useMemo(() => applyHide(nextWeekTasksAll), [nextWeekTasksAll, hideDone]);
+
+  const totalHoursToday = useMemo(() => dueTodayAll.filter((t) => !t.done).reduce((sum, t) => sum + (t.estimatedHours || 0), 0), [dueTodayAll]);
+
+  function summarize(list) {
+    const open = list.filter((t) => !t.done);
+    const hours = open.reduce((sum, t) => sum + (t.estimatedHours || 0), 0);
+    return hours > 0 ? `${open.length} · ${fmtEffort(hours)}` : `${open.length}`;
+  }
+
+  const filters = [
+    { id: "aktuell", label: "Aktuell", info: summarize([...overdueAll, ...dueTodayAll]) },
+    { id: "heute", label: "Heute", info: summarize(dueTodayAll) },
+    { id: "woche", label: "Laufende Woche", info: summarize(thisWeekTasksAll) },
+    { id: "naechsteWoche", label: "Nächste Woche", info: summarize(nextWeekTasksAll) },
+    { id: "ueberfaellig", label: "Überfällig", info: summarize(overdueAll) },
+  ];
+
+  function renderList(list, emptyText) {
+    if (list.length === 0) {
+      return (
+        <div className="rounded-xl px-4 py-8 text-center text-sm" style={{ background: "#242C3E44", color: "#6E7A94", border: "1px dashed #38415A" }}>
+          {emptyText}
+        </div>
+      );
+    }
+    return (
+      <div className="flex flex-col gap-2">
+        {list.map((t) => (
+          <TaskRow
+            key={t.id}
+            task={t}
+            project={projectById[t.projectId]}
+            categoryById={categoryById}
+            projects={projects}
+            onToggle={() => updateTask(t.id, { done: !t.done })}
+            onUpdate={(patch) => updateTask(t.id, patch)}
+            onDelete={() => deleteTask(t.id)}
+          />
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <div className="fade-in">
+      <div className="flex items-center justify-between mb-4">
+        <div>
+          <h2 className="sg text-lg" style={{ color: "#EDEAE2", fontWeight: 600 }}>
+            {new Date().toLocaleDateString("de-DE", { weekday: "long", day: "2-digit", month: "long" })}
+          </h2>
+          <p className="mono text-[11px] mt-0.5" style={{ color: "#6E7A94" }}>
+            {dueTodayAll.length} heute fällig{totalHoursToday ? ` · ${fmtEffort(totalHoursToday)} geschätzt` : ""}
+            {doneToday > 0 ? ` · ${doneToday} erledigt` : ""}
+          </p>
+        </div>
+      </div>
+
+      <label className="flex items-center gap-2 mono text-xs cursor-pointer mb-3" style={{ color: "#6E7A94" }}>
+        <input type="checkbox" checked={hideDone} onChange={(e) => setHideDone(e.target.checked)} style={{ accentColor: "#E8B54B" }} />
+        Erledigte ausblenden
+      </label>
+
+      <div className="flex flex-wrap gap-1.5 mb-5">
+        {filters.map((f) => (
+          <button
+            key={f.id}
+            onClick={() => setFilter(f.id)}
+            className="mono text-xs rounded-lg px-3 py-1.5"
+            style={{
+              background: filter === f.id ? "#E8B54B" : "#242C3E",
+              color: filter === f.id ? "#1B2130" : "#9AA3B5",
+              border: "none",
+              fontWeight: filter === f.id ? 600 : 400,
+            }}
+          >
+            {f.label} ({f.info})
+          </button>
+        ))}
+      </div>
+
+      {filter === "aktuell" && (
+        <>
+          {overdue.length > 0 && (
+            <div className="mb-5">
+              <h3 className="mono text-[11px] uppercase tracking-wide mb-2" style={{ color: "#E2704F" }}>
+                Überfällig ({overdue.length})
+              </h3>
+              {renderList(overdue, "Keine überfälligen Aufgaben.")}
+            </div>
+          )}
+          <div>
+            <h3 className="mono text-[11px] uppercase tracking-wide mb-2" style={{ color: "#6E7A94" }}>
+              Heute
+            </h3>
+            {renderList(dueToday, "Für heute nichts Fälliges eingetragen.")}
+          </div>
+        </>
+      )}
+
+      {filter === "heute" && renderList(dueToday, "Für heute nichts Fälliges eingetragen.")}
+      {filter === "ueberfaellig" && renderList(overdue, "Keine überfälligen Aufgaben.")}
+      {filter === "woche" && renderList(thisWeekTasks, "Für diese Woche nichts eingetragen.")}
+      {filter === "naechsteWoche" && renderList(nextWeekTasks, "Für nächste Woche nichts eingetragen.")}
+    </div>
+  );
+}
+
+function NotizenTab({ voiceNotes, updateVoiceNote, deleteVoiceNote }) {
+  const sorted = useMemo(() => voiceNotes.slice().sort((a, b) => (a.capturedAt < b.capturedAt ? 1 : -1)), [voiceNotes]);
+
+  return (
+    <div className="fade-in">
+      <div className="flex flex-col gap-2">
+        {sorted.length === 0 && (
+          <div className="rounded-xl px-4 py-8 text-center text-sm" style={{ background: "#242C3E44", color: "#6E7A94", border: "1px dashed #38415A" }}>
+            Noch keine Sprachnotizen. Über "Diktieren" aufnehmen — die KI erkennt automatisch, ob es eine Aufgabe oder eine Notiz ist.
+          </div>
+        )}
+        {sorted.map((n) => (
+          <NoteRow key={n.id} note={n} onUpdate={(patch) => updateVoiceNote(n.id, patch)} onDelete={() => deleteVoiceNote(n.id)} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function NoteRow({ note, onUpdate, onDelete }) {
+  const [editing, setEditing] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [draft, setDraft] = useState(note);
+
+  function openEdit() {
+    setDraft(note);
+    setConfirmingDelete(false);
+    setEditing(true);
+  }
+
+  function closeEdit() {
+    setEditing(false);
+    setConfirmingDelete(false);
+  }
+
+  function saveEdit() {
+    onUpdate({ title: draft.title.trim() || note.title, content: draft.content });
+    setEditing(false);
+  }
+
+  function fmtCaptured(iso) {
+    const d = new Date(iso);
+    return d.toLocaleString("de-DE", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
+  }
+
+  if (editing) {
+    return (
+      <div className="fade-in rounded-xl p-3" style={{ background: "#242C3E", border: "1px solid #7FA8E055" }}>
+        <input
+          value={draft.title}
+          onChange={(e) => setDraft({ ...draft, title: e.target.value })}
+          className="w-full sg text-sm rounded-lg px-2.5 py-2 mb-2"
+          style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2", fontWeight: 600 }}
+          autoFocus
+        />
+        <textarea
+          value={draft.content}
+          onChange={(e) => setDraft({ ...draft, content: e.target.value })}
+          rows={6}
+          className="w-full text-sm rounded-lg px-2.5 py-2 mb-3"
+          style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2", resize: "vertical" }}
+        />
+        <div className="flex items-center justify-between pt-2" style={{ borderTop: "1px solid #38415A" }}>
+          {!confirmingDelete ? (
+            <button onClick={() => setConfirmingDelete(true)} className="mono text-xs px-2 py-1.5 rounded-lg" style={{ color: "#E2704F", border: "none", background: "transparent" }}>
+              Notiz löschen
+            </button>
+          ) : (
+            <div className="flex gap-2">
+              <button onClick={onDelete} className="mono text-xs px-2.5 py-1.5 rounded-lg" style={{ background: "#E2704F", color: "#1B2130", border: "none", fontWeight: 600 }}>
+                Endgültig löschen
+              </button>
+              <button onClick={() => setConfirmingDelete(false)} className="mono text-xs px-2.5 py-1.5 rounded-lg" style={{ background: "#38415A", color: "#9AA3B5", border: "none" }}>
+                Abbrechen
+              </button>
+            </div>
+          )}
+          <div className="flex gap-2">
+            <button onClick={closeEdit} className="mono text-xs px-2.5 py-1.5 rounded-lg" style={{ color: "#6E7A94", border: "none", background: "transparent" }}>
+              Abbrechen
+            </button>
+            <button onClick={saveEdit} className="sg text-xs px-3 py-1.5 rounded-lg" style={{ background: "#7FA8E0", color: "#1B2130", fontWeight: 600, border: "none" }}>
+              Speichern
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div onClick={openEdit} className="fade-in rounded-xl px-4 py-3" style={{ background: "#242C3E", borderLeft: "3px solid #7FA8E0", cursor: "pointer" }}>
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-sm" style={{ color: "#EDEAE2", fontWeight: 600 }}>
+          {note.title}
+        </span>
+        <span className="mono text-[10px] flex-shrink-0 ml-2" style={{ color: "#6E7A94" }}>
+          {fmtCaptured(note.capturedAt)}
+        </span>
+      </div>
+      <p className="text-xs" style={{ color: "#9AA3B5", whiteSpace: "pre-wrap" }}>
+        {note.content}
+      </p>
+    </div>
+  );
+}
+
+function ErfassenTab({ projects, categories, createProject, addTask, inbox, addToInbox, removeFromInbox, addVoiceNote }) {
+  const [transcript, setTranscript] = useState("");
+  const [isListening, setIsListening] = useState(false);
+  const [speechSupported, setSpeechSupported] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [processingInboxId, setProcessingInboxId] = useState(null);
+  const [suggestions, setSuggestions] = useState([]);
+  const [noteSuggestions, setNoteSuggestions] = useState([]);
+  const [sourceTexts, setSourceTexts] = useState([]);
+  const [aiError, setAiError] = useState(null);
+  const [confirmingInboxId, setConfirmingInboxId] = useState(null);
+  const recognitionRef = useRef(null);
+  const textareaRef = useRef(null);
+
+  useEffect(() => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    setSpeechSupported(!!SR);
+  }, []);
+
+  useEffect(() => {
+    if (suggestions.length === 0 && noteSuggestions.length === 0) setSourceTexts([]);
+  }, [suggestions, noteSuggestions]);
+
+  function toggleListening() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      textareaRef.current && textareaRef.current.focus();
+      return;
+    }
+    if (isListening) {
+      recognitionRef.current && recognitionRef.current.stop();
+      setIsListening(false);
+      return;
+    }
+    const recognition = new SR();
+    recognition.lang = "de-DE";
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    let base = transcript ? transcript + " " : "";
+    recognition.onresult = (event) => {
+      let interim = "";
+      let finalChunk = "";
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const t = event.results[i][0].transcript;
+        if (event.results[i].isFinal) finalChunk += t + " ";
+        else interim += t;
+      }
+      if (finalChunk) base += finalChunk;
+      setTranscript((base + interim).trim());
+    };
+    recognition.onerror = () => setIsListening(false);
+    recognition.onend = () => setIsListening(false);
+    recognitionRef.current = recognition;
+    recognition.start();
+    setIsListening(true);
+  }
+
+  async function extractSuggestions(text) {
+    const catList = categories.slice().sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+    const projectList = activeProjects(projects)
+      .map((p) => `- ${p.name} (${catList.find((c) => c.id === p.type)?.name || p.type})`)
+      .join("\n");
+    const categoryNameList = catList.map((c) => `- ${c.name}`).join("\n");
+    const taskTypeList = Object.entries(TASK_TYPES).map(([id, meta]) => `- ${id}: ${meta.label}`).join("\n");
+    const systemPrompt = `Du verarbeitest diktierten deutschen Text für den Handwerksbetrieb (Zimmerei) eines Nutzers. Heutiges Datum: ${todayIso()}.
+Bestehende Listen:
+${projectList}
+
+Verfügbare Kategorien für Listen:
+${categoryNameList}
+
+Verfügbare Aufgabentypen:
+${taskTypeList}
+
+Der Text kann mehrere, thematisch unterschiedliche Elemente aus verschiedenen Momenten des Tages enthalten. Für jedes Element entscheidest du zuerst, ob es sich um eine AUFGABE (etwas Konkretes, das erledigt werden muss) oder eine NOTIZ (eine Gedächtnisstütze/Protokoll ohne direkten Handlungsauftrag, z. B. Zusammenfassung eines Telefonats, einer Baubesprechung, einer Beobachtung oder Information zum Nachschlagen) handelt.
+
+Gib AUSSCHLIESSLICH ein valides JSON-Array zurück, ohne Markdown-Codeblock, ohne Fließtext davor oder danach. Jedes Objekt braucht ein Feld "kind" mit dem Wert "aufgabe" oder "notiz".
+
+Für kind="aufgabe" zusätzlich exakt diese Felder:
+- title: kurzer, prägnanter Titel (max. ca. 8 Wörter)
+- notes: Langtext mit Details, oder leerer String falls nichts Zusätzliches genannt wurde
+- priority: Ganzzahl von 1 (niedrig) bis 10 (sehr hoch), schätze sinnvoll falls nicht explizit genannt (Standard 5)
+- estimatedHours: geschätzter Zeitaufwand in Stunden als Dezimalzahl gerundet auf Viertelstunden (z. B. 0.25, 0.5, 1.5, 2), nur falls im Text ein Zeitaufwand genannt oder klar erkennbar ist, sonst null
+- deadline: Datum im Format YYYY-MM-DD, löse relative Angaben wie "nächsten Freitag" oder "in zwei Wochen" anhand des heutigen Datums auf, sonst null
+- projectName: exakter Name einer der oben gelisteten bestehenden Listen, falls der Text klar dazu passt, sonst null
+- categoryName: exakter Name einer der oben gelisteten Kategorien, deine beste Einschätzung
+- suggestedNewProjectName: falls es klingt, als gehöre die Aufgabe zu einer neuen Liste (z. B. neues Bauvorhaben), die noch nicht existiert, deren Name, sonst null. Nenne hier NUR den unterscheidenden Namen (z. B. den Bauherren- oder Objektnamen wie "Schwarz" oder "Familie Müller") — wiederhole NICHT den Kategorienamen (z. B. nicht "Bauvorhaben"), da die Kategorie separat als categoryName angezeigt wird.
+- taskType: eine der ID aus der Liste der Aufgabentypen oben, die am besten passt (Standard "allgemein")
+
+Für kind="notiz" NUR diese Felder (keine der Aufgaben-Felder):
+- title: kurzer, prägnanter Titel (max. ca. 8 Wörter)
+- content: die vollständige, gut lesbare, in ordentlichen Sätzen aufbereitete Version des gesprochenen Inhalts. Fasse zusammen, räume Füllwörter und Versprecher auf, aber lass keine inhaltliche Information weg.
+
+Wenn der Text mehrere Elemente enthält, gib mehrere Objekte zurück.`;
+
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1500,
+        system: systemPrompt,
+        messages: [{ role: "user", content: text }],
+      }),
+    });
+    if (!response.ok) {
+      const errBody = await response.text().catch(() => "");
+      throw new Error(`API-Fehler ${response.status}: ${errBody.slice(0, 200)}`);
+    }
+    const data = await response.json();
+    if (data.type === "error") {
+      throw new Error(data.error?.message || "Unbekannter API-Fehler");
+    }
+    const respText = (data.content || []).map((c) => c.text || "").join("\n");
+    const clean = respText.replace(/```json|```/g, "").trim();
+    let parsed;
+    try {
+      parsed = JSON.parse(clean);
+    } catch (e) {
+      throw new Error("Antwort konnte nicht gelesen werden: " + clean.slice(0, 150));
+    }
+    const arr = Array.isArray(parsed) ? parsed : [parsed];
+
+    const taskItems = arr.filter((item) => item.kind !== "notiz");
+    const noteItems = arr.filter((item) => item.kind === "notiz");
+
+    const tasksBuilt = taskItems.map((item) => {
+      let resolvedProjectId = null;
+      let isNewProject = false;
+      let newProjectName = null;
+      const matchedCategory = catList.find((c) => c.name.toLowerCase() === String(item.categoryName || "").toLowerCase());
+      const resolvedCategoryId = matchedCategory ? matchedCategory.id : catList[0]?.id;
+      if (item.projectName) {
+        const match = projects.find((p) => p.name.toLowerCase() === String(item.projectName).toLowerCase());
+        if (match) resolvedProjectId = match.id;
+      }
+      if (!resolvedProjectId && item.suggestedNewProjectName) {
+        isNewProject = true;
+        newProjectName = stripRedundantTypeWord(item.suggestedNewProjectName, matchedCategory?.name);
+      }
+      if (!resolvedProjectId && !isNewProject) {
+        const sameCategoryProject = activeProjects(projects).find((p) => p.type === resolvedCategoryId);
+        resolvedProjectId = sameCategoryProject ? sameCategoryProject.id : activeProjects(projects)[0]?.id || projects[0]?.id;
+      }
+      return {
+        tempId: uid("sug_"),
+        title: item.title || "Ohne Titel",
+        notes: item.notes || "",
+        priority: Math.min(10, Math.max(1, parseInt(item.priority, 10) || 5)),
+        estimatedHours: item.estimatedHours ? Math.round(parseFloat(item.estimatedHours) * 4) / 4 : null,
+        deadline: item.deadline || "",
+        projectId: resolvedProjectId,
+        isNewProject,
+        newProjectName,
+        newProjectType: resolvedCategoryId || catList[0]?.id,
+        taskType: TASK_TYPES[item.taskType] ? item.taskType : "allgemein",
+      };
+    });
+
+    const notesBuilt = noteItems.map((item) => ({
+      tempId: uid("notesug_"),
+      title: item.title || "Sprachnotiz",
+      content: item.content || "",
+    }));
+
+    return { tasks: tasksBuilt, notes: notesBuilt };
+  }
+
+  async function extractSuggestionsWithRetry(text) {
+    const delays = [500, 1200];
+    let lastError;
+    try {
+      return await extractSuggestions(text);
+    } catch (e) {
+      lastError = e;
+    }
+    for (const delay of delays) {
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      try {
+        return await extractSuggestions(text);
+      } catch (e) {
+        lastError = e;
+      }
+    }
+    throw lastError;
+  }
+
+  async function processTranscript() {
+    if (!transcript.trim()) return;
+    setIsProcessing(true);
+    setAiError(null);
+    try {
+      const built = await extractSuggestionsWithRetry(transcript);
+      setSourceTexts((prev) => [...prev, transcript.trim()]);
+      setSuggestions((prev) => [...prev, ...built.tasks]);
+      setNoteSuggestions((prev) => [...prev, ...built.notes]);
+      setTranscript("");
+    } catch (e) {
+      setAiError("Verarbeitung fehlgeschlagen: " + (e.message || "unbekannter Fehler"));
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  function saveForLater() {
+    if (!transcript.trim()) return;
+    addToInbox(transcript.trim());
+    setTranscript("");
+  }
+
+  async function processInboxItem(item) {
+    setProcessingInboxId(item.id);
+    setAiError(null);
+    try {
+      const built = await extractSuggestionsWithRetry(item.text);
+      setSourceTexts((prev) => [...prev, item.text]);
+      setSuggestions((prev) => [...prev, ...built.tasks]);
+      setNoteSuggestions((prev) => [...prev, ...built.notes]);
+      removeFromInbox(item.id);
+    } catch (e) {
+      setAiError("Verarbeitung fehlgeschlagen: " + (e.message || "unbekannter Fehler"));
+    } finally {
+      setProcessingInboxId(null);
+    }
+  }
+
+  async function processAllInbox() {
+    if (!inbox.length) return;
+    setIsProcessing(true);
+    setAiError(null);
+    try {
+      const combined = inbox.map((i) => i.text).join("\n---\n");
+      const built = await extractSuggestionsWithRetry(combined);
+      setSourceTexts((prev) => [...prev, ...inbox.map((i) => i.text)]);
+      setSuggestions((prev) => [...prev, ...built.tasks]);
+      setNoteSuggestions((prev) => [...prev, ...built.notes]);
+      removeFromInbox(inbox.map((i) => i.id));
+    } catch (e) {
+      setAiError("Verarbeitung fehlgeschlagen: " + (e.message || "unbekannter Fehler"));
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  function updateSuggestion(tempId, patch) {
+    setSuggestions((prev) => prev.map((s) => (s.tempId === tempId ? { ...s, ...patch } : s)));
+  }
+
+  function discardSuggestion(tempId) {
+    setSuggestions((prev) => prev.filter((s) => s.tempId !== tempId));
+  }
+
+  function confirmSuggestion(s) {
+    let projectId = s.projectId;
+    if (s.isNewProject && s.newProjectName) {
+      const p = createProject(s.newProjectName, s.newProjectType);
+      projectId = p.id;
+    }
+    addTask({
+      title: s.title,
+      notes: s.notes,
+      priority: s.priority,
+      estimatedHours: s.estimatedHours || null,
+      deadline: s.deadline || null,
+      projectId,
+      type: s.taskType || "allgemein",
+    });
+    discardSuggestion(s.tempId);
+  }
+
+  function confirmAll() {
+    suggestions.forEach((s) => confirmSuggestion(s));
+  }
+
+  function updateNoteSuggestion(tempId, patch) {
+    setNoteSuggestions((prev) => prev.map((s) => (s.tempId === tempId ? { ...s, ...patch } : s)));
+  }
+
+  function discardNoteSuggestion(tempId) {
+    setNoteSuggestions((prev) => prev.filter((s) => s.tempId !== tempId));
+  }
+
+  function confirmNoteSuggestion(s) {
+    addVoiceNote({ title: s.title, content: s.content });
+    discardNoteSuggestion(s.tempId);
+  }
+
+  function confirmAllNotes() {
+    noteSuggestions.forEach((s) => confirmNoteSuggestion(s));
+  }
+
+  function fmtCapturedTime(iso) {
+    const d = new Date(iso);
+    return d.toLocaleString("de-DE", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+  }
+
+  return (
+    <div className="fade-in">
+      <div className="rounded-xl p-4 mb-4" style={{ background: "#242C3E" }}>
+        <div className="flex items-center gap-3 mb-3">
+          <button
+            onClick={toggleListening}
+            className={isListening ? "mic-live" : ""}
+            style={{
+              width: 52,
+              height: 52,
+              borderRadius: "50%",
+              background: isListening ? "#E2704F" : "#E8B54B",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              flexShrink: 0,
+              border: "none",
+            }}
+            aria-label="Diktat starten oder stoppen"
+          >
+            <span style={{ fontSize: 20 }}>{isListening ? "■" : "🎤"}</span>
+          </button>
+          <div>
+            <p className="sg text-sm" style={{ color: "#EDEAE2", fontWeight: 600 }}>
+              {isListening ? "Höre zu …" : "Aufgaben diktieren"}
+            </p>
+            <p className="mono text-[11px]" style={{ color: "#6E7A94" }}>
+              {speechSupported
+                ? "Sprich Titel, Deadline, Priorität, Liste einfach so, wie sie dir einfallen."
+                : "Live-Diktat hier nicht verfügbar – tippe unten ins Feld und nutze das Mikrofon deiner Tastatur."}
+            </p>
+          </div>
+        </div>
+        <textarea
+          ref={textareaRef}
+          value={transcript}
+          onChange={(e) => setTranscript(e.target.value)}
+          placeholder="z. B. „Für das Bauvorhaben Müller die Dachlatten bestellen, bis Freitag, ziemlich dringend“"
+          rows={4}
+          className="w-full rounded-lg px-3 py-2.5 text-sm"
+          style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2", resize: "vertical" }}
+        />
+        <div className="flex justify-end gap-2 mt-2">
+          <button
+            onClick={saveForLater}
+            disabled={!transcript.trim()}
+            className="mono text-xs rounded-lg px-3 py-2"
+            style={{
+              background: "transparent",
+              border: `1px solid ${transcript.trim() ? "#6E7A94" : "#38415A"}`,
+              color: transcript.trim() ? "#9AA3B5" : "#4B5468",
+            }}
+          >
+            Für später speichern
+          </button>
+          <button
+            onClick={processTranscript}
+            disabled={!transcript.trim() || isProcessing}
+            className="sg text-sm rounded-lg px-4 py-2"
+            style={{
+              background: !transcript.trim() || isProcessing ? "#38415A" : "#E8B54B",
+              color: !transcript.trim() || isProcessing ? "#6E7A94" : "#1B2130",
+              fontWeight: 600,
+              border: "none",
+            }}
+          >
+            {isProcessing ? "Verarbeite …" : "Jetzt verarbeiten"}
+          </button>
+        </div>
+        {aiError && (
+          <p className="mono text-xs mt-2" style={{ color: "#E2704F" }}>
+            {aiError}
+          </p>
+        )}
+      </div>
+
+      {inbox.length > 0 && (
+        <div className="rounded-xl p-4 mb-4 fade-in" style={{ background: "#242C3E", border: "1px solid #38415A" }}>
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="sg text-sm" style={{ color: "#EDEAE2", fontWeight: 600 }}>
+              Eingang ({inbox.length})
+            </h3>
+            <button
+              onClick={processAllInbox}
+              disabled={isProcessing}
+              className="sg text-xs rounded-lg px-3 py-1.5"
+              style={{ background: "#E8B54B", color: "#1B2130", fontWeight: 600, border: "none" }}
+            >
+              Alle verarbeiten
+            </button>
+          </div>
+          <p className="mono text-[11px] mb-3" style={{ color: "#6E7A94" }}>
+            Noch nicht durch die KI sortiert – bleibt sicher hier, bis du Zeit hast.
+          </p>
+          <div className="flex flex-col gap-2">
+            {inbox.map((item) => (
+              <div key={item.id} className="rounded-lg px-3 py-2.5" style={{ background: "#1B2130" }}>
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex-1 min-w-0">
+                    <p className="mono text-[10px] mb-1" style={{ color: "#4B5468" }}>
+                      {fmtCapturedTime(item.capturedAt)}
+                    </p>
+                    <p className="text-xs" style={{ color: "#EDEAE2" }}>
+                      {item.text}
+                    </p>
+                  </div>
+                  <div className="flex flex-col gap-1 flex-shrink-0">
+                    <button
+                      onClick={() => processInboxItem(item)}
+                      disabled={processingInboxId === item.id}
+                      className="mono text-[10px] px-2 py-1 rounded"
+                      style={{ background: "#38415A", color: "#EDEAE2", border: "none" }}
+                    >
+                      {processingInboxId === item.id ? "…" : "Verarbeiten"}
+                    </button>
+                    {confirmingInboxId !== item.id ? (
+                      <button
+                        onClick={() => setConfirmingInboxId(item.id)}
+                        className="mono text-[10px] px-2 py-1 rounded"
+                        style={{ background: "transparent", color: "#4B5468", border: "none" }}
+                      >
+                        ✕
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => { removeFromInbox(item.id); setConfirmingInboxId(null); }}
+                        className="mono text-[10px] px-2 py-1 rounded"
+                        style={{ background: "#E2704F", color: "#1B2130", border: "none", fontWeight: 600 }}
+                      >
+                        Löschen?
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {(suggestions.length > 0 || noteSuggestions.length > 0) && (
+        <div className="fade-in">
+          {sourceTexts.length > 0 && (
+            <div className="rounded-xl p-3 mb-3" style={{ background: "#1B2130", border: "1px dashed #38415A" }}>
+              <p className="mono text-[10px] uppercase tracking-wide mb-1.5" style={{ color: "#6E7A94" }}>
+                Diktiert
+              </p>
+              {sourceTexts.map((t, i) => (
+                <p key={i} className="text-xs mb-1.5 last:mb-0" style={{ color: "#9AA3B5" }}>
+                  {t}
+                </p>
+              ))}
+            </div>
+          )}
+
+          {suggestions.length > 0 && (
+            <div className="mb-5">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="sg text-sm" style={{ color: "#EDEAE2", fontWeight: 600 }}>
+                  Aufgaben-Vorschläge ({suggestions.length})
+                </h3>
+                <button onClick={confirmAll} className="sg text-xs rounded-lg px-3 py-1.5" style={{ background: "#6FBF8B", color: "#1B2130", fontWeight: 600, border: "none" }}>
+                  Alle anlegen
+                </button>
+              </div>
+              <div className="flex flex-col gap-3">
+                {suggestions.map((s) => (
+                  <SuggestionCard
+                    key={s.tempId}
+                    s={s}
+                    projects={projects}
+                    categories={categories}
+                    onChange={(patch) => updateSuggestion(s.tempId, patch)}
+                    onConfirm={() => confirmSuggestion(s)}
+                    onDiscard={() => discardSuggestion(s.tempId)}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {noteSuggestions.length > 0 && (
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="sg text-sm" style={{ color: "#EDEAE2", fontWeight: 600 }}>
+                  Notiz-Vorschläge ({noteSuggestions.length})
+                </h3>
+                <button onClick={confirmAllNotes} className="sg text-xs rounded-lg px-3 py-1.5" style={{ background: "#7FA8E0", color: "#1B2130", fontWeight: 600, border: "none" }}>
+                  Alle anlegen
+                </button>
+              </div>
+              <div className="flex flex-col gap-3">
+                {noteSuggestions.map((s) => (
+                  <NoteSuggestionCard
+                    key={s.tempId}
+                    s={s}
+                    onChange={(patch) => updateNoteSuggestion(s.tempId, patch)}
+                    onConfirm={() => confirmNoteSuggestion(s)}
+                    onDiscard={() => discardNoteSuggestion(s.tempId)}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SuggestionCard({ s, projects, categories, onChange, onConfirm, onDiscard }) {
+  return (
+    <div className="rounded-xl p-3" style={{ background: "#242C3E", border: `1px solid ${priorityColor(s.priority)}55` }}>
+      <input
+        value={s.title}
+        onChange={(e) => onChange({ title: e.target.value })}
+        className="w-full sg text-sm rounded-lg px-2.5 py-2 mb-2"
+        style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2", fontWeight: 600 }}
+      />
+      <textarea
+        value={s.notes}
+        onChange={(e) => onChange({ notes: e.target.value })}
+        placeholder="Notizen …"
+        rows={2}
+        className="w-full text-xs rounded-lg px-2.5 py-2 mb-2"
+        style={{ background: "#1B2130", border: "1px solid #38415A", color: "#9AA3B5", resize: "vertical" }}
+      />
+      <div className="flex flex-wrap gap-2 mb-2">
+        <select
+          value={s.taskType}
+          onChange={(e) => onChange({ taskType: e.target.value })}
+          className="mono text-[11px] rounded px-2 py-1"
+          style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}
+        >
+          {Object.entries(TASK_TYPES).map(([id, meta]) => (
+            <option key={id} value={id}>
+              {meta.icon} {meta.label}
+            </option>
+          ))}
+        </select>
+        <div className="flex items-center gap-1.5 mono text-[11px]" style={{ color: "#6E7A94" }}>
+          Priorität
+          <select
+            value={s.priority}
+            onChange={(e) => onChange({ priority: parseInt(e.target.value, 10) })}
+            className="mono text-xs rounded px-2 py-1"
+            style={{ background: "#1B2130", border: "1px solid #38415A", color: priorityColor(s.priority) }}
+          >
+            {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
+              <option key={n} value={n}>
+                {n}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="flex items-center gap-1.5 mono text-[11px]" style={{ color: "#6E7A94" }}>
+          Aufwand
+          <select
+            value={s.estimatedHours || ""}
+            onChange={(e) => onChange({ estimatedHours: e.target.value ? parseFloat(e.target.value) : null })}
+            className="mono text-xs rounded px-2 py-1"
+            style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}
+          >
+            <option value="">–</option>
+            {EFFORT_OPTIONS.map((h) => (
+              <option key={h} value={h}>
+                {fmtEffort(h)}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="flex items-center gap-1.5 mono text-[11px]" style={{ color: "#6E7A94" }}>
+          Deadline
+          <input
+            type="date"
+            value={s.deadline || ""}
+            onChange={(e) => onChange({ deadline: e.target.value })}
+            className="mono text-xs rounded px-2 py-1"
+            style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}
+          />
+        </div>
+        <select
+          value={s.isNewProject ? "__new__" : s.projectId}
+          onChange={(e) => {
+            if (e.target.value === "__new__") onChange({ isNewProject: true });
+            else onChange({ isNewProject: false, projectId: e.target.value });
+          }}
+          className="mono text-[11px] rounded px-2 py-1"
+          style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}
+        >
+          {activeProjects(projects, s.projectId).map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
+          ))}
+          {s.isNewProject && <option value="__new__">+ Neue Liste</option>}
+        </select>
+      </div>
+      {s.isNewProject && (
+        <div className="flex gap-2 mb-2">
+          <input
+            value={s.newProjectName || ""}
+            onChange={(e) => onChange({ newProjectName: e.target.value })}
+            placeholder="Name der neuen Liste"
+            className="flex-1 text-xs rounded-lg px-2.5 py-1.5"
+            style={{ background: "#1B2130", border: "1px solid #E8B54B", color: "#EDEAE2" }}
+          />
+          <select
+            value={s.newProjectType}
+            onChange={(e) => onChange({ newProjectType: e.target.value })}
+            className="mono text-[11px] rounded px-2"
+            style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}
+          >
+            {categories.slice().sort((a, b) => (a.order ?? 0) - (b.order ?? 0)).map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+      <div className="flex justify-end gap-2">
+        <button onClick={onDiscard} className="mono text-xs px-2.5 py-1.5 rounded-lg" style={{ color: "#6E7A94", border: "none", background: "transparent" }}>
+          Verwerfen
+        </button>
+        <button onClick={onConfirm} className="sg text-xs px-3 py-1.5 rounded-lg" style={{ background: "#E8B54B", color: "#1B2130", fontWeight: 600, border: "none" }}>
+          Anlegen
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function NoteSuggestionCard({ s, onChange, onConfirm, onDiscard }) {
+  return (
+    <div className="rounded-xl p-3" style={{ background: "#242C3E", border: "1px solid #7FA8E055" }}>
+      <input
+        value={s.title}
+        onChange={(e) => onChange({ title: e.target.value })}
+        className="w-full sg text-sm rounded-lg px-2.5 py-2 mb-2"
+        style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2", fontWeight: 600 }}
+      />
+      <textarea
+        value={s.content}
+        onChange={(e) => onChange({ content: e.target.value })}
+        placeholder="Inhalt der Notiz …"
+        rows={4}
+        className="w-full text-sm rounded-lg px-2.5 py-2 mb-2"
+        style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2", resize: "vertical" }}
+      />
+      <div className="flex justify-end gap-2">
+        <button onClick={onDiscard} className="mono text-xs px-2.5 py-1.5 rounded-lg" style={{ color: "#6E7A94", border: "none", background: "transparent" }}>
+          Verwerfen
+        </button>
+        <button onClick={onConfirm} className="sg text-xs px-3 py-1.5 rounded-lg" style={{ background: "#7FA8E0", color: "#1B2130", fontWeight: 600, border: "none" }}>
+          Anlegen
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function AlleAufgabenTab({ tasks, projects, projectById, categoryById, filterProject, setFilterProject, hideDone, setHideDone, updateTask, deleteTask, addTask }) {
+  const [showQuickAdd, setShowQuickAdd] = useState(false);
+  const [search, setSearch] = useState("");
+
+  const filtered = useMemo(() => {
+    let list = tasks;
+    if (filterProject !== "alle") list = list.filter((t) => t.projectId === filterProject);
+    if (hideDone) list = list.filter((t) => !t.done);
+    const q = search.trim().toLowerCase();
+    if (q) {
+      list = list.filter((t) => {
+        const project = projectById[t.projectId];
+        const haystack = [
+          t.title,
+          t.notes,
+          fmtDeadline(t.deadline),
+          t.deadline,
+          fmtEffort(t.estimatedHours),
+          String(t.priority),
+          TASK_TYPES[t.type]?.label,
+          project?.name,
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+        return haystack.includes(q);
+      });
+    }
+    return list.slice().sort((a, b) => {
+      if (a.done !== b.done) return a.done ? 1 : -1;
+      const ad = a.deadline || "9999-99-99";
+      const bd = b.deadline || "9999-99-99";
+      if (ad !== bd) return ad < bd ? -1 : 1;
+      return b.priority - a.priority;
+    });
+  }, [tasks, filterProject, hideDone, search, projectById]);
+
+  return (
+    <div className="fade-in">
+      <input
+        value={search}
+        onChange={(e) => setSearch(e.target.value)}
+        placeholder="Suche in Titel, Notizen, Datum, Aufwand …"
+        className="w-full text-sm rounded-lg px-3 py-2.5 mb-3"
+        style={{ background: "#242C3E", border: "1px solid #38415A", color: "#EDEAE2" }}
+      />
+      <div className="flex flex-wrap items-center gap-2 mb-4">
+        <select
+          value={filterProject}
+          onChange={(e) => setFilterProject(e.target.value)}
+          className="mono text-xs rounded-lg px-2.5 py-2"
+          style={{ background: "#242C3E", border: "1px solid #38415A", color: "#EDEAE2" }}
+        >
+          <option value="alle">Alle Listen</option>
+          {projects.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+              {p.isArchived ? " (archiviert)" : ""}
+            </option>
+          ))}
+        </select>
+        <label className="flex items-center gap-2 mono text-xs cursor-pointer" style={{ color: "#6E7A94" }}>
+          <input type="checkbox" checked={hideDone} onChange={(e) => setHideDone(e.target.checked)} style={{ accentColor: "#E8B54B" }} />
+          Erledigte ausblenden
+        </label>
+        <button
+          onClick={() => setShowQuickAdd((v) => !v)}
+          className="sg text-xs rounded-lg px-3 py-2 ml-auto"
+          style={{ background: showQuickAdd ? "#38415A" : "#E8B54B", color: showQuickAdd ? "#EDEAE2" : "#1B2130", fontWeight: 600, border: "none" }}
+        >
+          {showQuickAdd ? "Schließen" : "+ Aufgabe"}
+        </button>
+      </div>
+
+      {showQuickAdd && <QuickAddForm projects={projects} onAdd={(t) => { addTask(t); setShowQuickAdd(false); }} />}
+
+      <div className="flex flex-col gap-2">
+        {filtered.length === 0 && (
+          <div className="rounded-xl px-4 py-8 text-center text-sm" style={{ background: "#242C3E44", color: "#6E7A94", border: "1px dashed #38415A" }}>
+            Keine Aufgaben gefunden.
+          </div>
+        )}
+        {filtered.map((t) => (
+          <TaskRow key={t.id} task={t} project={projectById[t.projectId]} categoryById={categoryById} projects={projects} onToggle={() => updateTask(t.id, { done: !t.done })} onUpdate={(patch) => updateTask(t.id, patch)} onDelete={() => deleteTask(t.id)} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function QuickAddForm({ projects, onAdd }) {
+  const [title, setTitle] = useState("");
+  const [projectId, setProjectId] = useState(activeProjects(projects)[0]?.id || "betrieblich");
+  const [priority, setPriority] = useState(5);
+  const [estimatedHours, setEstimatedHours] = useState("");
+  const [deadline, setDeadline] = useState("");
+  const [notes, setNotes] = useState("");
+  const [taskType, setTaskType] = useState("allgemein");
+
+  function submit() {
+    if (!title.trim()) return;
+    onAdd({ title: title.trim(), projectId, priority, estimatedHours: estimatedHours ? parseFloat(estimatedHours) : null, deadline: deadline || null, notes, type: taskType });
+    setTitle("");
+    setNotes("");
+    setDeadline("");
+    setPriority(5);
+    setEstimatedHours("");
+    setTaskType("allgemein");
+  }
+
+  return (
+    <div className="rounded-xl p-3 mb-4 flex flex-col gap-2 fade-in" style={{ background: "#242C3E" }}>
+      <input
+        value={title}
+        onChange={(e) => setTitle(e.target.value)}
+        onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
+        placeholder="Titel"
+        className="w-full text-sm rounded-lg px-2.5 py-2"
+        style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}
+        autoFocus
+      />
+      <textarea
+        value={notes}
+        onChange={(e) => setNotes(e.target.value)}
+        placeholder="Notizen (optional)"
+        rows={2}
+        className="w-full text-xs rounded-lg px-2.5 py-2"
+        style={{ background: "#1B2130", border: "1px solid #38415A", color: "#9AA3B5", resize: "vertical" }}
+      />
+      <div className="flex flex-wrap gap-2">
+        <select value={taskType} onChange={(e) => setTaskType(e.target.value)} className="mono text-[11px] rounded px-2 py-1.5" style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}>
+          {Object.entries(TASK_TYPES).map(([id, meta]) => (
+            <option key={id} value={id}>
+              {meta.icon} {meta.label}
+            </option>
+          ))}
+        </select>
+        <select value={projectId} onChange={(e) => setProjectId(e.target.value)} className="mono text-[11px] rounded px-2 py-1.5" style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}>
+          {activeProjects(projects, projectId).map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
+          ))}
+        </select>
+        <select value={priority} onChange={(e) => setPriority(parseInt(e.target.value, 10))} className="mono text-xs rounded px-2 py-1.5" style={{ background: "#1B2130", border: "1px solid #38415A", color: priorityColor(priority) }}>
+          {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
+            <option key={n} value={n}>
+              {n}
+            </option>
+          ))}
+        </select>
+        <select value={estimatedHours} onChange={(e) => setEstimatedHours(e.target.value)} className="mono text-xs rounded px-2 py-1.5" style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}>
+          <option value="">Aufwand –</option>
+          {EFFORT_OPTIONS.map((h) => (
+            <option key={h} value={h}>
+              {fmtEffort(h)}
+            </option>
+          ))}
+        </select>
+        <input type="date" value={deadline} onChange={(e) => setDeadline(e.target.value)} className="mono text-xs rounded px-2 py-1.5" style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }} />
+        <button type="button" onClick={submit} className="sg text-xs rounded-lg px-3 py-1.5 ml-auto" style={{ background: "#E8B54B", color: "#1B2130", fontWeight: 600, border: "none" }}>
+          Hinzufügen
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function TaskRow({ task, project, categoryById, projects, onToggle, onUpdate, onDelete }) {
+  const [editing, setEditing] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [draft, setDraft] = useState(task);
+  const dLeft = daysUntil(task.deadline);
+  const overdue = dLeft !== null && dLeft < 0 && !task.done;
+
+  function openEdit() {
+    setDraft({ ...task, deadline: task.deadline || "" });
+    setConfirmingDelete(false);
+    setEditing(true);
+  }
+
+  function closeEdit() {
+    setEditing(false);
+    setConfirmingDelete(false);
+  }
+
+  function saveEdit() {
+    onUpdate({
+      title: draft.title.trim() || task.title,
+      notes: draft.notes,
+      priority: Math.min(10, Math.max(1, parseInt(draft.priority, 10) || 1)),
+      estimatedHours: draft.estimatedHours ? parseFloat(draft.estimatedHours) : null,
+      deadline: draft.deadline || null,
+      projectId: draft.projectId,
+      type: draft.type,
+    });
+    setEditing(false);
+  }
+
+  if (editing) {
+    return (
+      <div className="fade-in rounded-xl p-3" style={{ background: "#242C3E", border: `1px solid ${priorityColor(draft.priority)}55` }}>
+        <input
+          value={draft.title}
+          onChange={(e) => setDraft({ ...draft, title: e.target.value })}
+          className="w-full sg text-sm rounded-lg px-2.5 py-2 mb-2"
+          style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2", fontWeight: 600 }}
+          autoFocus
+        />
+        <textarea
+          value={draft.notes}
+          onChange={(e) => setDraft({ ...draft, notes: e.target.value })}
+          placeholder="Notizen …"
+          rows={2}
+          className="w-full text-xs rounded-lg px-2.5 py-2 mb-2"
+          style={{ background: "#1B2130", border: "1px solid #38415A", color: "#9AA3B5", resize: "vertical" }}
+        />
+        <div className="flex flex-wrap gap-2 mb-3">
+          <select value={draft.type} onChange={(e) => setDraft({ ...draft, type: e.target.value })} className="mono text-[11px] rounded px-2 py-1" style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}>
+            {Object.entries(TASK_TYPES).map(([id, meta]) => (
+              <option key={id} value={id}>
+                {meta.icon} {meta.label}
+              </option>
+            ))}
+          </select>
+          <select
+            value={draft.priority}
+            onChange={(e) => setDraft({ ...draft, priority: e.target.value })}
+            className="mono text-xs rounded px-2 py-1"
+            style={{ background: "#1B2130", border: "1px solid #38415A", color: priorityColor(draft.priority) }}
+          >
+            {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
+              <option key={n} value={n}>
+                {n}
+              </option>
+            ))}
+          </select>
+          <select
+            value={draft.estimatedHours || ""}
+            onChange={(e) => setDraft({ ...draft, estimatedHours: e.target.value })}
+            className="mono text-xs rounded px-2 py-1"
+            style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}
+          >
+            <option value="">Aufwand –</option>
+            {EFFORT_OPTIONS.map((h) => (
+              <option key={h} value={h}>
+                {fmtEffort(h)}
+              </option>
+            ))}
+          </select>
+          <input
+            type="date"
+            value={draft.deadline || ""}
+            onChange={(e) => setDraft({ ...draft, deadline: e.target.value })}
+            className="mono text-xs rounded px-2 py-1"
+            style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}
+          />
+          <select value={draft.projectId} onChange={(e) => setDraft({ ...draft, projectId: e.target.value })} className="mono text-[11px] rounded px-2 py-1" style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}>
+            {activeProjects(projects, draft.projectId).map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+                {p.isArchived ? " (archiviert)" : ""}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="flex items-center justify-between pt-2" style={{ borderTop: "1px solid #38415A" }}>
+          {!confirmingDelete ? (
+            <button onClick={() => setConfirmingDelete(true)} className="mono text-xs px-2 py-1.5 rounded-lg" style={{ color: "#E2704F", border: "none", background: "transparent" }}>
+              Aufgabe löschen
+            </button>
+          ) : (
+            <div className="flex gap-2">
+              <button onClick={onDelete} className="mono text-xs px-2.5 py-1.5 rounded-lg" style={{ background: "#E2704F", color: "#1B2130", border: "none", fontWeight: 600 }}>
+                Endgültig löschen
+              </button>
+              <button onClick={() => setConfirmingDelete(false)} className="mono text-xs px-2.5 py-1.5 rounded-lg" style={{ background: "#38415A", color: "#9AA3B5", border: "none" }}>
+                Abbrechen
+              </button>
+            </div>
+          )}
+          <div className="flex gap-2">
+            <button onClick={closeEdit} className="mono text-xs px-2.5 py-1.5 rounded-lg" style={{ color: "#6E7A94", border: "none", background: "transparent" }}>
+              Abbrechen
+            </button>
+            <button onClick={saveEdit} className="sg text-xs px-3 py-1.5 rounded-lg" style={{ background: "#E8B54B", color: "#1B2130", fontWeight: 600, border: "none" }}>
+              Speichern
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      onClick={openEdit}
+      className="fade-in flex items-start gap-3 rounded-xl px-4 py-3"
+      style={{ background: "#242C3E", borderLeft: `3px solid ${priorityColor(task.priority)}`, opacity: task.done ? 0.5 : 1, cursor: "pointer" }}
+    >
+      <button
+        onClick={(e) => { e.stopPropagation(); onToggle(); }}
+        className="flex-shrink-0 rounded-full flex items-center justify-center mt-0.5"
+        style={{ width: 20, height: 20, border: `2px solid ${task.done ? "#6FBF8B" : "#4B5468"}`, background: task.done ? "#6FBF8B" : "transparent" }}
+        aria-label="Erledigt umschalten"
+      >
+        {task.done && <span style={{ color: "#1B2130", fontSize: 12, lineHeight: 1 }}>✓</span>}
+      </button>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-sm" style={{ color: "#EDEAE2", textDecoration: task.done ? "line-through" : "none" }}>
+            {TASK_TYPES[task.type]?.icon && <span className="mr-1.5">{TASK_TYPES[task.type].icon}</span>}
+            {task.title}
+          </span>
+          {project && (
+            <span className="mono text-[10px] px-1.5 py-0.5 rounded-full" style={{ background: `${categoryById[project.type]?.color || "#6E7A94"}22`, color: categoryById[project.type]?.color || "#6E7A94" }}>
+              {project.name}
+            </span>
+          )}
+        </div>
+        {task.notes && (
+          <p className="text-xs mt-1" style={{ color: "#6E7A94" }}>
+            {task.notes}
+          </p>
+        )}
+        <div className="flex items-center gap-3 mt-1.5">
+          {task.deadline && (
+            <span className="mono text-[11px]" style={{ color: overdue ? "#E2704F" : "#6E7A94" }}>
+              {overdue ? "überfällig · " : ""}
+              {fmtDeadline(task.deadline)}
+            </span>
+          )}
+          <span className="mono text-[11px]" style={{ color: priorityColor(task.priority) }}>
+            P{task.priority}
+          </span>
+          {task.estimatedHours ? (
+            <span className="mono text-[11px]" style={{ color: "#6E7A94" }}>
+              ⏱ {fmtEffort(task.estimatedHours)}
+            </span>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ProjekteTab({
+  projects,
+  tasks,
+  createProject,
+  deleteProject,
+  updateProject,
+  archiveProject,
+  unarchiveProject,
+  moveProject,
+  categories,
+  onOpenProject,
+}) {
+  const [showForm, setShowForm] = useState(false);
+  const [showArchive, setShowArchive] = useState(false);
+  const [name, setName] = useState("");
+  const [type, setType] = useState(categories[0]?.id || "");
+  const [confirmingId, setConfirmingId] = useState(null);
+  const [editingId, setEditingId] = useState(null);
+  const [editDraft, setEditDraft] = useState({ name: "", type: "" });
+
+  const sortedCategories = useMemo(() => categories.slice().sort((a, b) => (a.order ?? 0) - (b.order ?? 0)), [categories]);
+
+  function startEditProject(p) {
+    setEditDraft({ name: p.name, type: p.type });
+    setEditingId(p.id);
+    setConfirmingId(null);
+  }
+
+  function saveEditProject(p) {
+    if (editDraft.name.trim()) {
+      updateProject(p.id, { name: editDraft.name.trim(), type: editDraft.type });
+    }
+    setEditingId(null);
+  }
+
+  function submit() {
+    if (!name.trim() || !type) return;
+    createProject(name.trim(), type);
+    setName("");
+    setShowForm(false);
+  }
+
+  const grouped = useMemo(() => {
+    const g = {};
+    sortedCategories.forEach((c) => (g[c.id] = []));
+    projects
+      .filter((p) => !p.isArchived)
+      .forEach((p) => {
+        if (g[p.type]) g[p.type].push(p);
+      });
+    Object.values(g).forEach((list) => list.sort((a, b) => (a.order ?? 0) - (b.order ?? 0)));
+    return g;
+  }, [projects, sortedCategories]);
+
+  const archived = useMemo(() => projects.filter((p) => p.isArchived), [projects]);
+
+  return (
+    <div className="fade-in">
+      <div className="flex justify-end gap-2 mb-4">
+        <button onClick={() => setShowForm((v) => !v)} className="sg text-xs rounded-lg px-3 py-2" style={{ background: showForm ? "#38415A" : "#E8B54B", color: showForm ? "#EDEAE2" : "#1B2130", fontWeight: 600, border: "none" }}>
+          {showForm ? "Schließen" : "+ Neue Liste"}
+        </button>
+      </div>
+
+      {showForm && (
+        <div className="rounded-xl p-3 mb-5 flex flex-wrap gap-2 fade-in" style={{ background: "#242C3E" }}>
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
+            placeholder="Listenname, z. B. Bauvorhaben Müller"
+            className="flex-1 min-w-[180px] text-sm rounded-lg px-2.5 py-2"
+            style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}
+            autoFocus
+          />
+          <select value={type} onChange={(e) => setType(e.target.value)} className="mono text-xs rounded px-2" style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}>
+            {sortedCategories.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+              </option>
+            ))}
+          </select>
+          <button type="button" onClick={submit} className="sg text-xs rounded-lg px-3 py-2" style={{ background: "#E8B54B", color: "#1B2130", fontWeight: 600, border: "none" }}>
+            Anlegen
+          </button>
+        </div>
+      )}
+
+      {sortedCategories.map((cat, catIdx) => {
+        const list = grouped[cat.id] || [];
+        if (list.length === 0) return null;
+        return (
+          <div key={cat.id} className="mb-5">
+            <h3 className="mono text-[11px] uppercase tracking-wide mb-2" style={{ color: "#6E7A94" }}>
+              {cat.name}
+            </h3>
+            <div className="flex flex-col gap-2">
+              {list.map((p, idx) => {
+                const pTasks = tasks.filter((t) => t.projectId === p.id);
+                const open = pTasks.filter((t) => !t.done).length;
+                const isConfirming = confirmingId === p.id;
+                const isEditing = editingId === p.id;
+                return (
+                  <div key={p.id} className="rounded-xl px-4 py-3" style={{ background: "#242C3E", borderLeft: `3px solid ${cat.color}` }}>
+                    {isEditing ? (
+                      <div className="fade-in flex flex-wrap gap-2 items-center">
+                        <input
+                          value={editDraft.name}
+                          onChange={(e) => setEditDraft({ ...editDraft, name: e.target.value })}
+                          className="flex-1 min-w-[140px] text-sm rounded-lg px-2.5 py-2"
+                          style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}
+                          autoFocus
+                        />
+                        <select value={editDraft.type} onChange={(e) => setEditDraft({ ...editDraft, type: e.target.value })} className="mono text-xs rounded px-2 py-2" style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}>
+                          {sortedCategories.map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {c.name}
+                            </option>
+                          ))}
+                        </select>
+                        <button onClick={() => setEditingId(null)} className="mono text-xs px-2.5 py-2 rounded-lg" style={{ color: "#6E7A94", border: "none", background: "transparent" }}>
+                          Abbrechen
+                        </button>
+                        <button onClick={() => saveEditProject(p)} className="sg text-xs px-3 py-2 rounded-lg" style={{ background: "#E8B54B", color: "#1B2130", fontWeight: 600, border: "none" }}>
+                          Speichern
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-2">
+                        <div className="flex flex-col gap-0.5 flex-shrink-0">
+                          <button
+                            onClick={() => moveProject(p.id, "up")}
+                            disabled={idx === 0}
+                            className="mono px-1"
+                            style={{ color: idx === 0 ? "#38415A" : "#6E7A94", border: "none", background: "transparent", fontSize: 10, lineHeight: 1 }}
+                            aria-label="Nach oben"
+                          >
+                            ▲
+                          </button>
+                          <button
+                            onClick={() => moveProject(p.id, "down")}
+                            disabled={idx === list.length - 1}
+                            className="mono px-1"
+                            style={{ color: idx === list.length - 1 ? "#38415A" : "#6E7A94", border: "none", background: "transparent", fontSize: 10, lineHeight: 1 }}
+                            aria-label="Nach unten"
+                          >
+                            ▼
+                          </button>
+                        </div>
+                        <button onClick={() => onOpenProject(p.id)} className="flex-1 text-left" style={{ border: "none", background: "transparent" }}>
+                          <span className="sg text-sm" style={{ color: "#EDEAE2", fontWeight: 600 }}>
+                            {p.name}
+                          </span>
+                          <span className="mono text-[11px] ml-2" style={{ color: "#6E7A94" }}>
+                            {open} offen · {pTasks.length} gesamt
+                          </span>
+                        </button>
+                        {!isConfirming && (
+                          <button onClick={() => startEditProject(p)} className="mono text-xs px-1.5" style={{ color: "#4B5468", border: "none", background: "transparent" }} aria-label="Liste bearbeiten">
+                            ✎
+                          </button>
+                        )}
+                        {!isConfirming && (
+                          <button onClick={() => archiveProject(p.id)} className="mono text-xs px-1.5" style={{ color: "#4B5468", border: "none", background: "transparent" }} aria-label="Liste archivieren">
+                            🗄
+                          </button>
+                        )}
+                        {!isConfirming && projects.length > 1 && (
+                          <button onClick={() => setConfirmingId(p.id)} className="mono text-xs px-1.5" style={{ color: "#4B5468", border: "none", background: "transparent" }} aria-label="Liste löschen">
+                            ✕
+                          </button>
+                        )}
+                      </div>
+                    )}
+                    {isConfirming && (
+                      <div className="fade-in mt-2 pt-2" style={{ borderTop: "1px solid #38415A" }}>
+                        <p className="mono text-[11px] mb-2" style={{ color: "#E2704F" }}>
+                          {pTasks.length > 0
+                            ? `Liste löschen? ${pTasks.length} Aufgabe(n) werden in eine andere Liste verschoben.`
+                            : "Liste wirklich löschen?"}
+                        </p>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => { deleteProject(p.id); setConfirmingId(null); }}
+                            className="mono text-[11px] px-3 py-1.5 rounded"
+                            style={{ background: "#E2704F", color: "#1B2130", border: "none", fontWeight: 600 }}
+                          >
+                            Endgültig löschen
+                          </button>
+                          <button onClick={() => setConfirmingId(null)} className="mono text-[11px] px-3 py-1.5 rounded" style={{ background: "#38415A", color: "#9AA3B5", border: "none" }}>
+                            Abbrechen
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+
+      <div className="flex gap-2 mb-3">
+        <button
+          onClick={() => setShowArchive((v) => !v)}
+          className="mono text-xs rounded-lg px-3 py-2"
+          style={{ background: "transparent", border: "1px solid #38415A", color: "#6E7A94" }}
+        >
+          {showArchive ? "Archiv ausblenden" : `Archiv anzeigen (${archived.length})`}
+        </button>
+      </div>
+
+      {showArchive && (
+        <div className="fade-in">
+          {archived.length === 0 ? (
+            <p className="mono text-[11px]" style={{ color: "#4B5468" }}>
+              Keine archivierten Listen.
+            </p>
+          ) : (
+            <div className="flex flex-col gap-2">
+              {archived.map((p) => {
+                const pTasks = tasks.filter((t) => t.projectId === p.id);
+                return (
+                  <div key={p.id} className="flex items-center gap-3 rounded-xl px-4 py-3" style={{ background: "#242C3E44", border: "1px dashed #38415A" }}>
+                    <div className="flex-1">
+                      <span className="sg text-sm" style={{ color: "#9AA3B5", fontWeight: 600 }}>
+                        {p.name}
+                      </span>
+                      <span className="mono text-[11px] ml-2" style={{ color: "#6E7A94" }}>
+                        {pTasks.length} Aufgabe(n)
+                      </span>
+                    </div>
+                    <button onClick={() => unarchiveProject(p.id)} className="sg text-xs px-3 py-1.5 rounded-lg" style={{ background: "#38415A", color: "#EDEAE2", border: "none", fontWeight: 600 }}>
+                      Wiederherstellen
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CategoryManager({ categories, projects, createCategory, renameCategory, deleteCategory, moveCategory }) {
+  const [newName, setNewName] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const [editName, setEditName] = useState("");
+  const [blockedId, setBlockedId] = useState(null);
+  const [confirmingId, setConfirmingId] = useState(null);
+
+  function submitNew() {
+    if (!newName.trim()) return;
+    createCategory(newName.trim());
+    setNewName("");
+  }
+
+  function startEdit(c) {
+    setEditName(c.name);
+    setEditingId(c.id);
+    setConfirmingId(null);
+    setBlockedId(null);
+  }
+
+  function saveEdit(c) {
+    if (editName.trim()) renameCategory(c.id, editName.trim());
+    setEditingId(null);
+  }
+
+  function tryDelete(c) {
+    const inUse = projects.some((p) => p.type === c.id);
+    if (inUse) {
+      setBlockedId(c.id);
+      setConfirmingId(null);
+      return;
+    }
+    setConfirmingId(c.id);
+    setBlockedId(null);
+  }
+
+  function confirmDelete(c) {
+    deleteCategory(c.id);
+    setConfirmingId(null);
+  }
+
+  return (
+    <div className="rounded-xl p-4 mb-5 fade-in" style={{ background: "#242C3E", border: "1px solid #38415A" }}>
+      <h3 className="sg text-sm mb-3" style={{ color: "#EDEAE2", fontWeight: 600 }}>
+        Kategorien
+      </h3>
+      <div className="flex flex-col gap-2 mb-3">
+        {categories.map((c, idx) => {
+          const count = projects.filter((p) => p.type === c.id).length;
+          const isEditing = editingId === c.id;
+          const isBlocked = blockedId === c.id;
+          const isConfirming = confirmingId === c.id;
+          return (
+            <div key={c.id} className="rounded-lg px-3 py-2" style={{ background: "#1B2130" }}>
+              {isEditing ? (
+                <div className="flex items-center gap-2">
+                  <input
+                    value={editName}
+                    onChange={(e) => setEditName(e.target.value)}
+                    className="flex-1 text-sm rounded-lg px-2.5 py-1.5"
+                    style={{ background: "#242C3E", border: "1px solid #38415A", color: "#EDEAE2" }}
+                    autoFocus
+                  />
+                  <button onClick={() => setEditingId(null)} className="mono text-xs px-2 py-1.5 rounded-lg" style={{ color: "#6E7A94", border: "none", background: "transparent" }}>
+                    Abbrechen
+                  </button>
+                  <button onClick={() => saveEdit(c)} className="sg text-xs px-2.5 py-1.5 rounded-lg" style={{ background: "#E8B54B", color: "#1B2130", fontWeight: 600, border: "none" }}>
+                    Speichern
+                  </button>
+                </div>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <div className="flex flex-col gap-0.5 flex-shrink-0">
+                    <button onClick={() => moveCategory(c.id, "up")} disabled={idx === 0} className="mono px-1" style={{ color: idx === 0 ? "#38415A" : "#6E7A94", border: "none", background: "transparent", fontSize: 10, lineHeight: 1 }} aria-label="Nach oben">
+                      ▲
+                    </button>
+                    <button onClick={() => moveCategory(c.id, "down")} disabled={idx === categories.length - 1} className="mono px-1" style={{ color: idx === categories.length - 1 ? "#38415A" : "#6E7A94", border: "none", background: "transparent", fontSize: 10, lineHeight: 1 }} aria-label="Nach unten">
+                      ▼
+                    </button>
+                  </div>
+                  <span style={{ width: 10, height: 10, borderRadius: "50%", background: c.color, flexShrink: 0 }} />
+                  <span className="text-sm flex-1" style={{ color: "#EDEAE2" }}>
+                    {c.name}
+                    <span className="mono text-[11px] ml-2" style={{ color: "#6E7A94" }}>
+                      {count} Liste(n)
+                    </span>
+                  </span>
+                  <button onClick={() => startEdit(c)} className="mono text-xs px-1.5" style={{ color: "#4B5468", border: "none", background: "transparent" }} aria-label="Kategorie umbenennen">
+                    ✎
+                  </button>
+                  <button onClick={() => tryDelete(c)} className="mono text-xs px-1.5" style={{ color: "#4B5468", border: "none", background: "transparent" }} aria-label="Kategorie löschen">
+                    ✕
+                  </button>
+                </div>
+              )}
+              {isBlocked && (
+                <p className="mono text-[11px] mt-2" style={{ color: "#E2704F" }}>
+                  Wird von {count} Liste(n) verwendet – kann erst gelöscht werden, wenn keine Liste mehr dieser Kategorie zugeordnet ist.
+                </p>
+              )}
+              {isConfirming && (
+                <div className="flex gap-2 mt-2">
+                  <button onClick={() => confirmDelete(c)} className="mono text-[11px] px-3 py-1.5 rounded" style={{ background: "#E2704F", color: "#1B2130", border: "none", fontWeight: 600 }}>
+                    Endgültig löschen
+                  </button>
+                  <button onClick={() => setConfirmingId(null)} className="mono text-[11px] px-3 py-1.5 rounded" style={{ background: "#38415A", color: "#9AA3B5", border: "none" }}>
+                    Abbrechen
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      <div className="flex gap-2">
+        <input
+          value={newName}
+          onChange={(e) => setNewName(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") submitNew(); }}
+          placeholder="Neue Kategorie, z. B. Wartung"
+          className="flex-1 text-sm rounded-lg px-2.5 py-2"
+          style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}
+        />
+        <button type="button" onClick={submitNew} className="sg text-xs rounded-lg px-3 py-2" style={{ background: "#E8B54B", color: "#1B2130", fontWeight: 600, border: "none" }}>
+          Anlegen
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function LoginScreen({ onLogin, loading, error }) {
+  const [localError, setLocalError] = useState(null);
+  const emailRef = useRef(null);
+  const passwordRef = useRef(null);
+
+  function submit() {
+    const email = (emailRef.current?.value || "").trim();
+    const password = passwordRef.current?.value || "";
+    if (!email || !password) {
+      setLocalError("Bitte E-Mail-Adresse und Passwort eingeben.");
+      return;
+    }
+    setLocalError(null);
+    onLogin(email, password);
+  }
+
+  function handleKeyDown(e) {
+    if (e.key === "Enter") submit();
+  }
+
+  return (
+    <div style={{ background: "#1B2130", minHeight: "100vh", fontFamily: "Inter, sans-serif" }} className="flex items-center justify-center px-4">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap');
+        .sg { font-family: 'Space Grotesk', sans-serif; }
+      `}</style>
+      <div className="w-full max-w-xs rounded-2xl p-6" style={{ background: "#242C3E" }}>
+        <h1 className="sg text-xl mb-1" style={{ color: "#EDEAE2", fontWeight: 600 }}>
+          Kiba
+        </h1>
+        <p className="text-xs mb-5" style={{ color: "#6E7A94" }}>
+          Anmelden, um auf deine Aufgaben zuzugreifen.
+        </p>
+        <input
+          ref={emailRef}
+          name="email"
+          type="email"
+          defaultValue=""
+          placeholder="E-Mail-Adresse"
+          className="w-full text-sm rounded-lg px-3 py-2.5 mb-2"
+          style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}
+          autoCapitalize="none"
+          autoCorrect="off"
+          autoComplete="username"
+          onKeyDown={handleKeyDown}
+        />
+        <input
+          ref={passwordRef}
+          name="password"
+          type="password"
+          defaultValue=""
+          placeholder="Passwort"
+          className="w-full text-sm rounded-lg px-3 py-2.5 mb-3"
+          style={{ background: "#1B2130", border: "1px solid #38415A", color: "#EDEAE2" }}
+          autoComplete="current-password"
+          onKeyDown={handleKeyDown}
+        />
+        {(localError || error) && (
+          <p className="text-xs mb-3" style={{ color: "#E2704F" }}>
+            {localError || error}
+          </p>
+        )}
+        <button
+          type="button"
+          onClick={submit}
+          disabled={loading}
+          className="sg w-full text-sm rounded-lg py-2.5"
+          style={{ background: loading ? "#38415A" : "#E8B54B", color: loading ? "#6E7A94" : "#1B2130", fontWeight: 600, border: "none" }}
+        >
+          {loading ? "Melde an …" : "Anmelden"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function Wochenplaner() {
+  const [auth, setAuth] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authError, setAuthError] = useState(null);
+  const [loggingIn, setLoggingIn] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const stored = localStorage.getItem("kiba-refresh-token");
+        if (stored) {
+          const data = await firebaseRefreshToken(stored);
+          const idToken = data.id_token;
+          setAuth({
+            idToken,
+            refreshToken: data.refresh_token,
+            uid: data.user_id,
+            email: decodeJwt(idToken).email || "",
+            expiresAt: Date.now() + Number(data.expires_in) * 1000,
+          });
+        }
+      } catch (e) {
+        localStorage.removeItem("kiba-refresh-token");
+      } finally {
+        setAuthChecked(true);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!auth) return;
+    const msUntilRefresh = Math.max(auth.expiresAt - Date.now() - 5 * 60 * 1000, 10000);
+    const t = setTimeout(async () => {
+      try {
+        const data = await firebaseRefreshToken(auth.refreshToken);
+        const idToken = data.id_token;
+        setAuth({
+          idToken,
+          refreshToken: data.refresh_token,
+          uid: data.user_id,
+          email: decodeJwt(idToken).email || auth.email,
+          expiresAt: Date.now() + Number(data.expires_in) * 1000,
+        });
+        localStorage.setItem("kiba-refresh-token", data.refresh_token);
+      } catch (e) {
+        // wird beim nächsten Firestore-Zugriff sichtbar
+      }
+    }, msUntilRefresh);
+    return () => clearTimeout(t);
+  }, [auth]);
+
+  async function handleLogin(email, password) {
+    setLoggingIn(true);
+    setAuthError(null);
+    try {
+      const data = await firebaseSignIn(email, password);
+      setAuth({
+        idToken: data.idToken,
+        refreshToken: data.refreshToken,
+        uid: data.localId,
+        email: data.email || email,
+        expiresAt: Date.now() + Number(data.expiresIn) * 1000,
+      });
+      localStorage.setItem("kiba-refresh-token", data.refreshToken);
+    } catch (e) {
+      setAuthError(e.message || "Anmeldung fehlgeschlagen");
+    } finally {
+      setLoggingIn(false);
+    }
+  }
+
+  function handleLogout() {
+    setAuth(null);
+    localStorage.removeItem("kiba-refresh-token");
+  }
+
+  if (!authChecked) {
+    return (
+      <div style={{ background: "#1B2130", minHeight: "100vh" }} className="flex items-center justify-center">
+        <span style={{ color: "#9AA3B5", fontFamily: "Inter, sans-serif" }}>Lade …</span>
+      </div>
+    );
+  }
+
+  if (!auth) {
+    return <LoginScreen onLogin={handleLogin} loading={loggingIn} error={authError} />;
+  }
+
+  return <WochenplanerApp auth={auth} onLogout={handleLogout} onAuthRefreshed={setAuth} />;
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<Wochenplaner />);
+
+</script>
+</body>
+</html>
