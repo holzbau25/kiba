@@ -212,6 +212,7 @@ function WochenplanerApp({ auth, onLogout, onAuthRefreshed }) {
           expiresAt: Date.now() + Number(data.expires_in) * 1000,
         };
         authRef.current = refreshed;
+        localStorage.setItem("kiba-refresh-token", refreshed.refreshToken);
         onAuthRefreshed(refreshed);
         return await fn(refreshed.idToken);
       } catch (e2) {
@@ -2488,6 +2489,7 @@ function Wochenplaner() {
         if (stored) {
           const data = await firebaseRefreshToken(stored);
           const idToken = data.id_token;
+          localStorage.setItem("kiba-refresh-token", data.refresh_token);
           setAuth({
             idToken,
             refreshToken: data.refresh_token,
@@ -2497,7 +2499,11 @@ function Wochenplaner() {
           });
         }
       } catch (e) {
-        localStorage.removeItem("kiba-refresh-token");
+        const msg = String(e.message || "").toUpperCase();
+        if (msg.includes("TOKEN") || msg.includes("INVALID") || msg.includes("EXPIRED") || msg.includes("USER_DISABLED") || msg.includes("USER_NOT_FOUND")) {
+          localStorage.removeItem("kiba-refresh-token");
+        }
+        // bei anderen Fehlern (z. B. Netzwerk) Token behalten und beim nächsten Öffnen erneut versuchen
       } finally {
         setAuthChecked(true);
       }
